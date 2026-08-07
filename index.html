@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+<title>Gargantua — Schwarzschild Raytracer</title>
+<meta name="description" content="Buraco negro renderizado em tempo real integrando a geodésica nula da métrica de Schwarzschild, pixel a pixel, em WebGL2. Luz de verdade sendo curvada.">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'IBM Plex Mono',ui-monospace,'Courier New',monospace}
+  canvas{display:block;position:fixed;inset:0;touch-action:none;cursor:grab}
+  canvas:active{cursor:grabbing}
+  #ui{
+    position:fixed;left:26px;bottom:24px;z-index:5;color:#e8c9a0;pointer-events:none;
+    text-shadow:0 0 14px rgba(255,157,66,.3);
+  }
+  #ui h1{font-size:13px;letter-spacing:.44em;font-weight:400;text-transform:uppercase;color:#ffb877}
+  #ui p{margin-top:8px;font-size:10.5px;letter-spacing:.04em;color:#8a7460;max-width:300px;line-height:1.7}
+  #stats{
+    position:fixed;right:26px;bottom:24px;z-index:5;color:#5c4f42;font-size:10px;
+    letter-spacing:.1em;text-align:right;line-height:1.9;pointer-events:none;text-transform:uppercase;
+  }
+  #stats b{color:#ffb877;font-weight:400}
+  #hint{
+    position:fixed;top:24px;left:50%;transform:translateX(-50%);color:#5c4f42;font-size:10px;
+    letter-spacing:.18em;z-index:5;pointer-events:none;text-transform:uppercase;opacity:0;
+    transition:opacity 1s ease;
+  }
+  #hint.show{opacity:1}
+  #loading{
+    position:fixed;inset:0;background:#000;z-index:10;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;color:#ffb877;font-size:11px;
+    letter-spacing:.3em;text-transform:uppercase;transition:opacity .6s ease;
+  }
+  #loading .dot{width:5px;height:5px;border-radius:50%;background:#ffb877;animation:pulse 1.2s infinite ease-in-out}
+  @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+  #loading.hidden{opacity:0;pointer-events:none}
+  #err{
+    position:fixed;inset:0;background:#000;color:#e88;display:none;align-items:center;justify-content:center;
+    padding:40px;text-align:center;font-size:13px;line-height:1.7;z-index:11;
+  }
+  @media(max-width:640px){ #ui p{display:none} #stats{display:none} }
+</style>
+</head>
+<body>
+
+<div id="loading"><div class="dot"></div>GARGANTUA — CARREGANDO GEODÉSICAS</div>
+<div id="err"></div>
+<canvas id="c"></canvas>
+
+<div id="hint">arraste para orbitar · scroll para zoom</div>
+<div id="ui">
+  <h1>Gargantua</h1>
+  <p>Buraco negro de Schwarzschild — a luz de cada pixel é integrada ao longo da geodésica nula real. Nada aqui é desenhado; tudo é calculado a partir da curvatura do espaço-tempo.</p>
+</div>
+<div id="stats">
+  <div>massa <b>1.0 × 10⁸ M☉</b></div>
+  <div>raio de schwarzschild <b id="stat-rs">—</b></div>
+  <div>passos de integração <b id="stat-steps">260</b></div>
+</div>
+
+<script>
+(function(){
+  const canvas = document.getElementById('c');
+  const loading = document.getElementById('loading');
+  const errBox = document.getElementById('err');
+  const hintEl = document.getElementById('hint');
+
+  function fail(msg){
+    errBox.style.display = 'flex';
+    errBox.textContent = msg;
+    loading.classList.add('hidden');
+  }
+
+  const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+  if (!gl){ fail('Seu navegador não suporta WebGL2 — esse buraco negro precisa dele para curvar a luz em tempo real.'); return; }
+
+  const VERT = `#version 300 es
+  layout(location=0) in vec2 aPos;
+  void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }
+  `;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+  out vec4 outColor;
+
+  uniform vec2 uRes;
+  uniform vec3 uCamPos;
+  uniform vec3 uRight;
+  uniform vec3 uUp;
+  uniform vec3 uForward;
+  uniform float uTanFov;
+  uniform float uTime;
+  uniform float uInnerR;
+  uniform float uOuterR;
+
+  const float PI = 3.14159265359;
+  const int STEPS = 260;
+  const float STEP_H = 0.035;
+  const float ESCAPE_R = 45.0;
+
+  // ---------- hash / noise ----------
+  float hash21(vec2 p){
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+  }
+  float vnoise(vec2 p){
+    vec2 i = floor(p), f = fract(p);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0,0.0));
+    float c = hash21(i + vec2(0.0,1.0));
+    float d = hash21(i + vec2(1.0,1.0));
+    vec2 u = f*f*(3.0-2.0*f);
+    return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);
+  }
+  float fbm(vec2 p){
+    float s = 0.0, a = 0.5;
+    for (int i=0; i<5; i++){ s += a*vnoise(p); p *= 2.02; a *= 0.55; }
+    return s;
+  }
+
+  vec3 heat(float t){
+    t = clamp(t, 0.0, 1.0);
+    vec3 c0 = vec3(0.55, 0.06, 0.02);
+    vec3 c1 = vec3(1.00, 0.35, 0.08);
+    vec3 c2 = vec3(1.00, 0.65, 0.25);
+    vec3 c3 = vec3(1.00, 0.92, 0.75);
+    vec3 c4 = vec3(0.85, 0.92, 1.00);
+    float f = t * 4.0;
+    if (f < 1.0) return mix(c0, c1, f);
+    if (f < 2.0) return mix(c1, c2, f - 1.0);
+    if (f < 3.0) return mix(c2, c3, f - 2.0);
+    return mix(c3, c4, min(f - 3.0, 1.0));
+  }
+
+  vec3 background(vec3 dir){
+    vec2 uv = vec2(atan(dir.z, dir.x) / (2.0*PI) + 0.5, acos(clamp(dir.y,-1.0,1.0)) / PI);
+    vec3 col = vec3(0.0);
+    // nebula wash
+    float neb = fbm(uv * vec2(4.0, 3.0) + vec2(1.7, 4.2));
+    col += mix(vec3(0.02,0.02,0.05), vec3(0.06,0.03,0.09), neb) * 0.55;
+    // stars, two octaves
+    for (int oct = 0; oct < 2; oct++){
+      float scale = oct == 0 ? 340.0 : 140.0;
+      vec2 gp = uv * vec2(scale*2.0, scale);
+      vec2 gi = floor(gp), gf = fract(gp);
+      float h = hash21(gi + float(oct)*91.7);
+      float thresh = oct == 0 ? 0.986 : 0.965;
+      if (h > thresh){
+        vec2 starPos = vec2(hash21(gi+11.1), hash21(gi+37.7));
+        float d = length(gf - starPos);
+        float b = smoothstep(0.09, 0.0, d);
+        float tw = 0.65 + 0.35*sin(uTime*(1.5+h*3.0) + h*40.0);
+        float mag = fract(h*53.1);
+        col += vec3(0.85,0.9,1.0) * b * (0.35 + mag*0.9) * tw * (oct==0?0.8:1.3);
+      }
+    }
+    return col;
+  }
+
+  // returns vec4(color.rgb, hit=1.0/0.0)
+  vec4 traceDisk(vec3 pos, vec3 prevPos, vec3 camPos){
+    float r = length(pos.xz);
+    if (r < uInnerR || r > uOuterR) return vec4(0.0);
+    float ang = atan(pos.z, pos.x);
+    float t = 1.0 - (r - uInnerR) / (uOuterR - uInnerR);
+    vec3 base = heat(pow(t, 0.85));
+
+    float rot = uTime * (0.55 / pow(r/uInnerR, 1.5));
+    float streak = fbm(vec2(ang*3.2 - rot*2.0, r*0.9)) * 0.6 + fbm(vec2(ang*9.0 - rot*3.5, r*2.2)) * 0.4;
+    float density = smoothstep(0.15, 0.95, streak);
+
+    vec3 velDir = normalize(vec3(-pos.z, 0.0, pos.x));
+    vec3 toCam = normalize(camPos - pos);
+    float approach = dot(velDir, toCam);
+    float beam = pow(clamp(1.0 + approach * 1.6, 0.15, 4.0), 2.2);
+
+    float grRedshift = sqrt(clamp(1.0 - 1.0/max(r,1.001), 0.05, 1.0));
+
+    float edge = smoothstep(uInnerR, uInnerR*1.15, r) * smoothstep(uOuterR, uOuterR*0.9, r);
+    vec3 col = base * (0.35 + density*1.5) * beam * grRedshift * edge * 1.4;
+    return vec4(col, 1.0);
+  }
+
+  void geodesic(vec3 ro, vec3 rd, out vec3 colOut){
+    float r0 = length(ro);
+    vec3 e_r = ro / r0;
+    vec3 tangential = rd - dot(rd, e_r) * e_r;
+    float tlen = length(tangential);
+    vec3 e_t;
+    if (tlen < 1e-5){
+      vec3 arbitrary = abs(e_r.y) < 0.99 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
+      e_t = normalize(cross(e_r, arbitrary));
+    } else {
+      e_t = tangential / tlen;
+    }
+
+    float cospsi = dot(rd, e_r);
+    float sinpsi = clamp(tlen, 0.0, 1.0);
+    float b = max(r0 * sinpsi, 1e-4);
+
+    float u = 1.0 / r0;
+    float upSign = cospsi > 0.0 ? -1.0 : 1.0;
+    float disc = max(0.0, 1.0/(b*b) - u*u);
+    float up = upSign * sqrt(disc);
+
+    float phi = 0.0;
+    vec3 prevPos = ro;
+
+    for (int i = 0; i < STEPS; i++){
+      float k1u = up;
+      float k1up = -u + 1.5*u*u;
+      float u2 = u + 0.5*STEP_H*k1u;
+      float up2 = up + 0.5*STEP_H*k1up;
+      float k2u = up2;
+      float k2up = -u2 + 1.5*u2*u2;
+      float u3 = u + 0.5*STEP_H*k2u;
+      float up3 = up + 0.5*STEP_H*k2up;
+      float k3u = up3;
+      float k3up = -u3 + 1.5*u3*u3;
+      float u4 = u + STEP_H*k3u;
+      float up4 = up + STEP_H*k3up;
+      float k4u = up4;
+      float k4up = -u4 + 1.5*u4*u4;
+
+      u = u + (STEP_H/6.0)*(k1u + 2.0*k2u + 2.0*k3u + k4u);
+      up = up + (STEP_H/6.0)*(k1up + 2.0*k2up + 2.0*k3up + k4up);
+      phi += STEP_H;
+
+      if (u <= 1.0/ESCAPE_R){
+        vec3 dirEsc = normalize(cos(phi)*e_r + sin(phi)*e_t);
+        colOut = background(dirEsc);
+        return;
+      }
+      if (u >= 1.0){
+        colOut = vec3(0.0);
+        return;
+      }
+
+      float r = 1.0/u;
+      vec3 pos = r * (cos(phi)*e_r + sin(phi)*e_t);
+
+      if (sign(pos.y) != sign(prevPos.y)){
+        float denom = (prevPos.y - pos.y);
+        float tt = abs(denom) > 1e-6 ? prevPos.y / denom : 0.5;
+        vec3 crossPos = mix(prevPos, pos, clamp(tt,0.0,1.0));
+        vec4 dhit = traceDisk(crossPos, prevPos, uCamPos);
+        if (dhit.a > 0.5){
+          colOut = dhit.rgb;
+          return;
+        }
+      }
+      prevPos = pos;
+    }
+
+    vec3 dirEnd = normalize(cos(phi)*e_r + sin(phi)*e_t);
+    colOut = background(dirEnd) * 0.4;
+  }
+
+  void main(){
+    vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
+    vec3 rd = normalize(uForward + uv.x*uTanFov*uRight + uv.y*uTanFov*uUp);
+    vec3 ro = uCamPos;
+
+    vec3 col;
+    geodesic(ro, rd, col);
+
+    col = col / (col + vec3(1.0));
+    col = pow(col, vec3(1.0/2.15));
+
+    outColor = vec4(col, 1.0);
+  }
+  `;
+
+  function compile(type, src){
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)){
+      const info = gl.getShaderInfoLog(sh);
+      gl.deleteShader(sh);
+      throw new Error('Erro compilando shader: ' + info);
+    }
+    return sh;
+  }
+
+  let program;
+  try {
+    const vs = compile(gl.VERTEX_SHADER, VERT);
+    const fs = compile(gl.FRAGMENT_SHADER, FRAG);
+    program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)){
+      throw new Error('Erro linkando programa: ' + gl.getProgramInfoLog(program));
+    }
+  } catch (e){
+    fail('Não deu pra montar o shader do buraco negro:\n' + e.message);
+    return;
+  }
+
+  const quad = new Float32Array([-1,-1, 3,-1, -1,3]);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  const U = {};
+  ['uRes','uCamPos','uRight','uUp','uForward','uTanFov','uTime','uInnerR','uOuterR'].forEach(name => {
+    U[name] = gl.getUniformLocation(program, name);
+  });
+
+  gl.useProgram(program);
+  gl.uniform1f(U.uInnerR, 3.0);
+  gl.uniform1f(U.uOuterR, 9.5);
+
+  // ---------- camera ----------
+  let azimuth = 0.55, polar = 1.32, dist = 11.0;
+  let dragging = false, lastX = 0, lastY = 0;
+  let idleTimer = 0, autoRotate = true;
+
+  function clampPolar(p){ return Math.min(Math.max(p, 0.28), Math.PI - 0.28); }
+
+  function pointerDown(x, y){
+    dragging = true; lastX = x; lastY = y; autoRotate = false; idleTimer = 0;
+    if (!hintEl.dataset.shown){ hintEl.dataset.shown = '1'; hintEl.classList.add('show'); setTimeout(()=>hintEl.classList.remove('show'), 3600); }
+  }
+  function pointerMove(x, y){
+    if (!dragging) return;
+    const dx = x - lastX, dy = y - lastY;
+    lastX = x; lastY = y;
+    azimuth -= dx * 0.0055;
+    polar = clampPolar(polar - dy * 0.0045);
+  }
+  function pointerUp(){ dragging = false; idleTimer = 0; }
+
+  canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); pointerDown(e.clientX, e.clientY); });
+  canvas.addEventListener('pointermove', e => pointerMove(e.clientX, e.clientY));
+  canvas.addEventListener('pointerup', pointerUp);
+  canvas.addEventListener('pointercancel', pointerUp);
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    dist *= Math.exp(e.deltaY * 0.0011);
+    dist = Math.min(Math.max(dist, 4.2), 32.0);
+    idleTimer = 0; autoRotate = false;
+  }, { passive: false });
+
+  let pinchStart = null;
+  canvas.addEventListener('touchstart', e => {
+    if (e.touches.length === 2){
+      pinchStart = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+    }
+  }, { passive: true });
+  canvas.addEventListener('touchmove', e => {
+    if (e.touches.length === 2 && pinchStart){
+      const d = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+      dist *= pinchStart / d;
+      dist = Math.min(Math.max(dist, 4.2), 32.0);
+      pinchStart = d;
+    }
+  }, { passive: true });
+
+  const maxScale = Math.min(window.devicePixelRatio || 1, 2.0);
+  let renderScale = maxScale;
+
+  function resize(){
+    const cssW = window.innerWidth, cssH = window.innerHeight;
+    canvas.width = Math.max(1, Math.round(cssW * renderScale));
+    canvas.height = Math.max(1, Math.round(cssH * renderScale));
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  document.getElementById('stat-rs').textContent = '2.95 × 10⁸ km';
+
+  const tmp = new Float32Array(3);
+  function setV3(loc, x, y, z){ tmp[0]=x; tmp[1]=y; tmp[2]=z; gl.uniform3fv(loc, tmp); }
+
+  let start = performance.now();
+  let firstFrame = true;
+  let lastFrameTime = start;
+  let avgFrameMs = 16.7;
+  let qualityCheckAt = start + 1200;
+
+  function frame(now){
+    const t = (now - start) / 1000;
+    const dtMs = now - lastFrameTime;
+    lastFrameTime = now;
+    if (dtMs > 0 && dtMs < 250) avgFrameMs = avgFrameMs * 0.9 + dtMs * 0.1;
+
+    if (now > qualityCheckAt){
+      qualityCheckAt = now + 900;
+      if (avgFrameMs > 30 && renderScale > 0.45){
+        renderScale = Math.max(0.45, renderScale * 0.85);
+        resize();
+      } else if (avgFrameMs < 15 && renderScale < maxScale){
+        renderScale = Math.min(maxScale, renderScale * 1.08);
+        resize();
+      }
+    }
+
+    if (!dragging){
+      idleTimer += 1/60;
+      if (idleTimer > 3.2) autoRotate = true;
+    }
+    if (autoRotate) azimuth += 0.0011;
+
+    const camPos = [
+      dist * Math.sin(polar) * Math.sin(azimuth),
+      dist * Math.cos(polar),
+      dist * Math.sin(polar) * Math.cos(azimuth)
+    ];
+    const fwd = [-camPos[0]/dist, -camPos[1]/dist, -camPos[2]/dist];
+    const worldUp = [0,1,0];
+    let right = [
+      fwd[1]*worldUp[2]-fwd[2]*worldUp[1],
+      fwd[2]*worldUp[0]-fwd[0]*worldUp[2],
+      fwd[0]*worldUp[1]-fwd[1]*worldUp[0]
+    ];
+    const rl = Math.hypot(right[0],right[1],right[2]) || 1;
+    right = [right[0]/rl, right[1]/rl, right[2]/rl];
+    const up = [
+      right[1]*fwd[2]-right[2]*fwd[1],
+      right[2]*fwd[0]-right[0]*fwd[2],
+      right[0]*fwd[1]-right[1]*fwd[0]
+    ];
+
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    setV3(U.uCamPos, camPos[0], camPos[1], camPos[2]);
+    setV3(U.uRight, right[0], right[1], right[2]);
+    setV3(U.uUp, up[0], up[1], up[2]);
+    setV3(U.uForward, fwd[0], fwd[1], fwd[2]);
+    gl.uniform1f(U.uTanFov, Math.tan((42 * Math.PI/180) / 2));
+    gl.uniform1f(U.uTime, t);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (firstFrame){
+      firstFrame = false;
+      requestAnimationFrame(() => loading.classList.add('hidden'));
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
